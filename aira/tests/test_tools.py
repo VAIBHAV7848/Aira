@@ -4,6 +4,10 @@ import pytest
 from aira.tools.file_read import FileReadTool
 from aira.tools.file_write import FileWriteTool
 from aira.tools.python_runner import PythonRunnerTool
+from aira.tools.file_read import FileReadTool
+from aira.tools.file_write import FileWriteTool
+from aira.tools.python_runner import PythonRunnerTool
+from aira.tools.system_read import SystemReadTool, _sanitize_query
 from aira.tools.registry import ToolRegistry, ToolNotFoundError
 
 
@@ -146,3 +150,49 @@ def test_python_runner_outside_workspace(workspace):
     tool = PythonRunnerTool(workspace)
     result = tool.run("../../etc/hack.py")
     assert result.success is False
+
+
+# ── System Read Injection Tests ──
+
+def test_sanitize_query():
+    # Allow alphanumeric, space, dot, hyphen, underscore
+    assert _sanitize_query("hello world") == "hello world"
+    assert _sanitize_query("file-name_1.txt") == "file-name_1.txt"
+    
+    # Strip dangerous chars
+    assert _sanitize_query("hello; rm -rf") == "hello rm -rf"
+    assert _sanitize_query("$(shutdown)") == "shutdown"
+    assert _sanitize_query("file|pipe") == "filepipe"
+    assert _sanitize_query("file`tick") == "filetick"
+    assert _sanitize_query("'quote'") == "quote"
+    assert _sanitize_query('"double"') == "double"
+    assert _sanitize_query("{curly}") == "curly"
+
+def test_system_read_env_masking():
+    tool = SystemReadTool()
+    # Mock os.environ
+    import os
+    original_environ = os.environ.copy()
+    # Use a key that sorts early (starts with A) to avoid truncation
+    os.environ["AAA_SECRET_TOKEN"] = "12345:ABCDEF"
+    os.environ["SAFE_VAR"] = "public_info"
+    
+    try:
+        # Test individual fetch
+        res = tool.run(action="env_var", query="AAA_SECRET_TOKEN")
+        assert res.success is True
+        assert "12345:ABCDEF" not in res.output
+        assert "***MASKED***" in res.output
+        
+        res = tool.run(action="env_var", query="SAFE_VAR")
+        assert res.success is True
+        assert "public_info" in res.output
+        
+        # Test listing
+        res = tool.run(action="env_var")
+        assert res.success is True
+        assert "***MASKED***" in res.output
+        assert "12345:ABCDEF" not in res.output
+    finally:
+        os.environ.clear()
+        os.environ.update(original_environ)

@@ -119,7 +119,7 @@ class PersonaManager:
         except Exception:
             return self._keyword_intent(user_message)
 
-    async def get_chat_response(self, user_message: str, local_llm, history: list[str] = None) -> str:
+    async def get_chat_response(self, user_message: str, local_llm, history: Optional[list[str]] = None) -> str:
         """
         Generate a casual chat response as Aira.
 
@@ -160,7 +160,13 @@ class PersonaManager:
 
         cancel_words = ["cancel", "stop", "abort", "nevermind", "never mind"]
         status_words = ["status", "progress", "how much", "cost", "what's happening"]
-        task_words = ["read", "write", "create", "run", "execute", "build", "make", "fix", "edit", "delete"]
+        task_words = [
+            "read", "write", "create", "run", "execute", "build", "make", "fix",
+            "edit", "delete", "open", "close", "list", "show", "check", "find",
+            "search", "process", "processes", "disk", "gpu", "system", "install",
+            "folder", "file", "directory", "app", "program", "network", "info",
+            "battery", "power",  # Added battery
+        ]
 
         if any(w in msg for w in cancel_words):
             return "cancel"

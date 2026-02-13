@@ -43,12 +43,20 @@ class PythonRunnerTool:
                     error=f"Not a Python file: {script_path}",
                 )
 
-            # Execute with strict sandboxing
+            # Execute with strict sandboxing — minimal env, no secrets
+            import os
+            safe_env = {
+                "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
+                "SYSTEMDRIVE": os.environ.get("SYSTEMDRIVE", "C:"),
+                "PATH": str(Path(sys.executable).parent),
+                "TEMP": os.environ.get("TEMP", r"C:\Users\Default\AppData\Local\Temp"),
+                "TMP": os.environ.get("TMP", r"C:\Users\Default\AppData\Local\Temp"),
+            }
             result = subprocess.run(
                 [sys.executable, str(resolved)],
                 shell=False,           # NEVER shell=True
                 cwd=str(self.workspace_root),
-                env={},                # Empty env — no system secrets
+                env=safe_env,          # Minimal env — no system secrets
                 timeout=self.timeout,
                 capture_output=True,
                 text=True,

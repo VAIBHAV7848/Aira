@@ -52,6 +52,11 @@ def validate_path(target: str | Path, workspace_root: Path) -> Path:
         )
 
     # 2. Must not be a symlink
+    # NOTE: This is a TOCTOU (Time-of-Check to Time-of-Use) race condition.
+    # A malicious actor could swap the file for a symlink after this check but before usage.
+    # On Windows/Python stdlib, completely avoiding this is difficult without
+    # rewriting all file I/O to use low-level OS handles.
+    # We accept this residual risk for now.
     if resolved.exists() and resolved.is_symlink():
         raise SecurityError(
             f"Symlink blocked: '{resolved}' is a symbolic link"

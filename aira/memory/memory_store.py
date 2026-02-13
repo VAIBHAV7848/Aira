@@ -62,10 +62,20 @@ class MemoryStore:
         self.db_path = Path(db_path)
         self._db: Optional[aiosqlite.Connection] = None
 
+    @property
+    def _conn(self) -> aiosqlite.Connection:
+        """Return DB connection or raise if not initialized."""
+        if self._db is None:
+            raise RuntimeError(
+                "MemoryStore not initialized. Call await init_db() first."
+            )
+        return self._db
+
     async def init_db(self) -> None:
         """Initialise the database and create tables."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(self.db_path))
+        await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(SCHEMA)
         await self._db.commit()
 
@@ -79,7 +89,7 @@ class MemoryStore:
     async def save_task(self, task_id: str, data: dict) -> None:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
-        await self._db.execute(
+        await self._conn.execute(
             """INSERT OR REPLACE INTO tasks 
                (task_id, description, status, created_at, updated_at, summary, metadata)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -93,10 +103,10 @@ class MemoryStore:
                 json.dumps(data.get("metadata", {})),
             ),
         )
-        await self._db.commit()
+        await self._conn.commit()
 
     async def get_task(self, task_id: str) -> Optional[dict]:
-        cursor = await self._db.execute(
+        cursor = await self._conn.execute(
             "SELECT task_id, description, status, created_at, updated_at, summary, metadata FROM tasks WHERE task_id = ?",
             (task_id,),
         )
@@ -116,18 +126,18 @@ class MemoryStore:
     async def update_task_status(self, task_id: str, status: str, summary: str = "") -> None:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
-        await self._db.execute(
+        await self._conn.execute(
             "UPDATE tasks SET status = ?, summary = ?, updated_at = ? WHERE task_id = ?",
             (status, summary, now, task_id),
         )
-        await self._db.commit()
+        await self._conn.commit()
 
     # ── Task Steps ──
 
     async def save_step(self, task_id: str, step_data: dict) -> None:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
-        await self._db.execute(
+        await self._conn.execute(
             """INSERT INTO task_steps 
                (task_id, iteration, tool_name, parameters, output, success, duration_ms, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -142,7 +152,7 @@ class MemoryStore:
                 now,
             ),
         )
-        await self._db.commit()
+        await self._conn.commit()
 
     # ── Summaries (with token cap) ──
 
@@ -150,7 +160,7 @@ class MemoryStore:
         """
         Get recent task summaries, capped at MAX_SUMMARY_TOKENS total.
         """
-        cursor = await self._db.execute(
+        cursor = await self._conn.execute(
             "SELECT summary FROM tasks WHERE summary != '' ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         )
@@ -176,14 +186,14 @@ class MemoryStore:
     async def save_preference(self, key: str, value: str) -> None:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
-        await self._db.execute(
+        await self._conn.execute(
             "INSERT OR REPLACE INTO preferences (key, value, updated_at) VALUES (?, ?, ?)",
             (key, value, now),
         )
-        await self._db.commit()
+        await self._conn.commit()
 
     async def get_preference(self, key: str) -> Optional[str]:
-        cursor = await self._db.execute(
+        cursor = await self._conn.execute(
             "SELECT value FROM preferences WHERE key = ?", (key,)
         )
         row = await cursor.fetchone()
@@ -194,14 +204,14 @@ class MemoryStore:
     async def save_persona_state(self, key: str, value: str) -> None:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
-        await self._db.execute(
+        await self._conn.execute(
             "INSERT OR REPLACE INTO persona_state (key, value, updated_at) VALUES (?, ?, ?)",
             (key, value, now),
         )
-        await self._db.commit()
+        await self._conn.commit()
 
     async def get_persona_state(self, key: str) -> Optional[str]:
-        cursor = await self._db.execute(
+        cursor = await self._conn.execute(
             "SELECT value FROM persona_state WHERE key = ?", (key,)
         )
         row = await cursor.fetchone()

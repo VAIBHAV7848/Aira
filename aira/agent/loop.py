@@ -71,6 +71,8 @@ class AgentLoop:
         plan: dict = {}
         step_index = 0
         validation_errors: list[str] = []
+        failed_plan_keys: set[str] = set()  # Track plans that already failed
+        replan_count = 0  # Prevent infinite replans
 
         # Save task to memory
         await self.memory.save_task(task_id, {
@@ -102,7 +104,14 @@ class AgentLoop:
 
                     # Ask planner for a plan
                     try:
-                        plan = await self._get_plan(context, task_description)
+                        plan = await self._get_plan(
+                            context, task_description,
+                            skip_keywords=failed_plan_keys,
+                        )
+                        # Generate a key for this plan to detect repeated failures
+                        plan_key = json.dumps(
+                            plan.get("steps", []), sort_keys=True, default=str
+                        )[:200]
                         step_index = 0
                         log_entry["plan_steps"] = len(plan.get("steps", []))
                     except Exception as e:
@@ -161,6 +170,11 @@ class AgentLoop:
 
                         if not last_tool_result.success:
                             log_entry["error"] = last_tool_result.error
+                            # Track this plan as failed so we don't repeat it
+                            plan_key = json.dumps(
+                                plan.get("steps", []), sort_keys=True, default=str
+                            )[:200]
+                            failed_plan_keys.add(plan_key)
                             sm.transition(TaskState.FAILED, f"tool failed: {last_tool_result.error}")
                             self._write_log(log_file, log_entry)
                             break
@@ -197,6 +211,11 @@ class AgentLoop:
                         sm.transition(TaskState.CONFIRMING_COMPLETION, "all goals met")
                     else:
                         # More work needed or planner says not done
+                        replan_count += 1
+                        if replan_count > 3:
+                            sm.transition(TaskState.FAILED, "max replans exceeded")
+                            self._write_log(log_file, log_entry)
+                            break
                         sm.transition(TaskState.PLANNING, "needs replan")
                         plan = {}  # Clear for next planning cycle
 
@@ -254,28 +273,229 @@ class AgentLoop:
 
         return final
 
-    async def _get_plan(self, context: str, description: str) -> dict:
-        """Get a plan using the local or external planner."""
-        # Try local model first (simple JSON plan)
+    async def _get_plan(
+        self,
+        context: str,
+        task_description: str,
+        skip_keywords: set[str] | None = None,
+    ) -> dict:
+        """
+        Generate a plan using:
+        1. Keyword heuristic (fast, deterministic)
+        2. Local LLM (flexible)
+        3. External Planner (smart, costly)
+        """
+        # 1. Keyword Planner
+        # We try this first because it's instant and reliable for simple tasks.
+        keyword_plan = self._build_keyword_plan(task_description, skip_keywords)
+        if keyword_plan:
+            logger.info("Using keyword-based plan")
+            return keyword_plan
+
+        # 2. Local LLM Planner
+        # Used for complex tasks that don't match simple keywords.
+        system_prompt = (
+             "You are a task planner. Given a context and task, produce a JSON plan.\n"
+             "Respond ONLY with valid JSON:\n"
+             '{"steps": [{"tool": "tool_name", "params": {...}}], "done": false}\n'
+             "Available tools:\n"
+             "- file_read(path)\n"
+             "- file_write(path, content)\n"
+             "- python_run(script_path)\n"
+             "- system_read(action, path?, query?)\n"
+             "- system_command(command)  <-- use for ANY shell/system command\n"
+        )
         try:
             prompt = (
-                f"Create a JSON plan for this task:\n{description}\n\n"
+                f"Create a JSON plan for this task:\n{task_description}\n\n"
                 f"Context:\n{context}\n\n"
-                'Respond ONLY with JSON: {{"steps": [{{"tool": "name", "params": {{}}, "description": "..."}}], "confidence": 0.0-1.0, "done": false}}\n'
-                "Available tools: file_read, file_write, python_run"
+                'Respond ONLY with valid JSON, no markdown, no explanation:\n'
+                '{"steps": [{"tool": "tool_name", "params": {"key": "value"}, "description": "what this does"}], "confidence": 0.8, "done": true}\n\n'
+                "Available tools (use EXACT names):\n"
+                "- system_read: params {action, path, query}. Actions: read_file, list_dir, system_info, processes, disk_usage, gpu_info, network_info, installed_apps, search_files, env_var\n"
+                "- system_command: params {command}. Runs PowerShell (requires user confirmation)\n"
+                "- file_read: params {path}. Read file in workspace\n"
+                "- file_write: params {path, content}. Write file in workspace\n"
+                "- python_run: params {code}. Run Python code\n"
             )
             raw = await self.local_llm.generate(prompt)
-            plan = json.loads(raw)
+            plan = self._extract_json(raw)
+            if plan and plan.get("steps"):
+                plan = self._normalize_plan(plan)
+                # Validate — only use if all tools are valid
+                errors = self._validate_plan(plan)
+                if not errors:
+                    logger.info(f"Local LLM plan valid with {len(plan['steps'])} steps")
+                    return plan
+                else:
+                    logger.warning(f"LLM plan invalid: {errors}")
+        except Exception as e:
+            logger.warning(f"Local plan failed: {e}")
+
+        # 3. External planner only if API key configured
+        if hasattr(self.planner, "plan") and getattr(self.planner, "api_key", ""):
+            try:
+                return await self.planner.plan(context, description)
+            except Exception as e:
+                logger.warning(f"External planner failed: {e}")
+
+        # 4. Ultimate fallback — system_info (better than empty/failed)
+        return {"steps": [{"tool": "system_read", "params": {"action": "system_info"}, "description": "Get general system info"}], "confidence": 0.3, "done": True}
+
+    def _normalize_plan(self, plan: dict) -> dict:
+        """Fix common LLM mistakes in tool names and params."""
+        TOOL_ALIASES = {
+            "read_system": "system_read",
+            "system": "system_read",
+            "shell": "system_command",
+            "shell_exec": "system_command",
+            "shell_run": "system_command",
+            "powershell": "system_command",
+            "run_command": "system_command",
+            "exec": "system_command",
+            "read": "file_read",
+            "write": "file_write",
+            "python": "python_run",
+            "run_python": "python_run",
+        }
+
+        for step in plan.get("steps", []):
+            tool = step.get("tool", "")
+            if tool in TOOL_ALIASES:
+                step["tool"] = TOOL_ALIASES[tool]
+            # If tool was aliased to system_read but has no action, infer it
+            if step["tool"] == "system_read" and "action" not in step.get("params", {}):
+                # The old tool name might BE the action
+                if tool in ("system_info", "gpu_info", "disk_usage", "processes", "network_info"):
+                    step.setdefault("params", {})["action"] = tool
+        return plan
+
+    def _extract_json(self, raw: str) -> dict:
+        """Try hard to extract JSON from LLM output (handles markdown fences, etc)."""
+        import re
+        # Direct parse
+        try:
+            return json.loads(raw.strip())
+        except json.JSONDecodeError:
+            pass
+
+        # Try extracting from markdown code blocks
+        patterns = [
+            r'```json\s*(.*?)\s*```',
+            r'```\s*(.*?)\s*```',
+            r'(\{.*\})',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, raw, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1).strip())
+                except json.JSONDecodeError:
+                    continue
+        return {}
+
+    def _build_keyword_plan(self, task: str, skip_keywords: set[str] | None = None) -> Optional[dict]:
+        """
+        Simple heuristic planner for common tasks.
+        Returns a plan dict or None if no keywords match.
+        """
+        t = task.lower()
+        
+        # Helper to check if a plan was already attempted and failed
+        def _make_plan(steps: list[dict], confidence: float = 0.9) -> Optional[dict]:
+            plan = {"steps": steps, "confidence": confidence, "done": True}
+            if skip_keywords:
+                plan_key = json.dumps(steps, sort_keys=True, default=str)[:200]
+                if plan_key in skip_keywords:
+                    logger.info(f"Skipping failed keyword plan: {plan_key}")
+                    return None
             return plan
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"Local plan failed, trying external: {e}")
 
-        # Fallback to external planner
-        if hasattr(self.planner, "plan"):
-            return await self.planner.plan(context, description)
+        # System info queries
+        if any(w in t for w in ["battery", "power", "charging"]):
+            return _make_plan([{"tool": "system_read", "params": {"action": "system_info"}, "description": "Get system info including battery"}])
 
-        # Last resort — empty plan
-        return {"steps": [], "confidence": 0.0, "done": False}
+        if any(w in t for w in ["gpu", "vram", "graphics", "nvidia"]):
+            return _make_plan([{"tool": "system_read", "params": {"action": "gpu_info"}, "description": "Get GPU information"}])
+
+        if any(w in t for w in ["process", "running", "task manager", "what's running"]):
+            query = ""
+            # Extract app name if mentioned
+            for word in ["chrome", "python", "node", "code", "discord", "spotify", "steam", "ollama"]:
+                if word in t:
+                    query = word
+                    break
+            return _make_plan([{"tool": "system_read", "params": {"action": "processes", "query": query}, "description": "List running processes"}])
+
+        if any(w in t for w in ["disk", "storage", "space", "drive"]):
+            return _make_plan([{"tool": "system_read", "params": {"action": "disk_usage"}, "description": "Check disk usage"}])
+
+        if any(w in t for w in ["network", "ip", "wifi", "internet", "connection"]):
+            return _make_plan([{"tool": "system_read", "params": {"action": "network_info"}, "description": "Get network info"}])
+        
+        if any(w in t for w in ["app", "installed", "program", "software"]):
+             return _make_plan([{"tool": "system_read", "params": {"action": "installed_apps"}, "description": "List installed apps"}])
+
+        # File listing (e.g. "what files in X")
+        if any(w in t for w in ["list", "show files", "dir", "ls"]):
+             path = self._extract_path(task)
+             return _make_plan([{"tool": "system_read", "params": {"action": "list_dir", "path": str(path)}, "description": f"List files in {path}"}])
+
+        return None
+
+        if any(w in t for w in ["open ", "launch ", "start ", "close ", "kill ", "shutdown", "restart"]):
+            # Build a shell command from the request
+            if "open" in t or "launch" in t or "start" in t:
+                app = task.split("open")[-1].split("launch")[-1].split("start")[-1].strip()
+                cmd = f"Start-Process '{app}'"
+            elif "close" in t or "kill" in t:
+                app = task.split("close")[-1].split("kill")[-1].strip()
+                cmd = f"Stop-Process -Name '{app}' -Force"
+            else:
+                cmd = task
+            return _make_plan([{"tool": "system_command", "params": {"command": cmd}, "description": f"Shell: {cmd}"}])
+
+        # Generic system query — try system_info as default
+        if any(w in t for w in ["what", "how", "check", "tell me", "show"]):
+            return _make_plan([{"tool": "system_read", "params": {"action": "system_info"}, "description": "Get system information"}])
+
+        return None
+
+    @staticmethod
+    def _extract_path(text: str) -> str:
+        """Try to extract a file/directory path from text."""
+        import re
+        import subprocess
+        # Windows paths
+        match = re.search(r'([A-Za-z]:\\[^\s,\'"]+)', text)
+        if match:
+            return match.group(1)
+        # Use Windows API for common folders (handles OneDrive)
+        folder_map = {
+            "desktop": "Desktop",
+            "documents": "MyDocuments",
+            "downloads": None,
+            "pictures": "MyPictures",
+            "videos": "MyVideos",
+            "music": "MyMusic",
+        }
+        for name, enum_name in folder_map.items():
+            if name in text.lower():
+                if enum_name:
+                    try:
+                        result = subprocess.run(
+                            ["powershell", "-Command",
+                             f"[Environment]::GetFolderPath('{enum_name}')"],
+                            capture_output=True, text=True, timeout=3
+                        )
+                        if result.returncode == 0 and result.stdout.strip():
+                            return result.stdout.strip()
+                    except Exception:
+                        pass
+                elif name == "downloads":
+                    return str(Path.home() / "Downloads")
+                return str(Path.home() / name.capitalize())
+        return ""
 
     def _validate_plan(self, plan: dict) -> list[str]:
         """Validate plan structure. Returns list of errors."""
@@ -299,7 +519,11 @@ class AgentLoop:
         """Execute a tool by name with given parameters."""
         try:
             tool = self.tools.get(tool_name)
-            result = tool.run(**params) if not callable(getattr(tool, 'run', None)) else tool.run(**params)
+            import asyncio
+            result = tool.run(**params)
+            # Handle async tools (like shell_tool)
+            if asyncio.iscoroutine(result):
+                result = await result
             if not isinstance(result, ToolResult):
                 return ToolResult(success=False, output="", error="Tool did not return ToolResult")
             return result

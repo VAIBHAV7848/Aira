@@ -6,17 +6,22 @@ Wires all components together and starts the Telegram bot.
 import asyncio
 import logging
 import sys
+import os
+import certifi
 from pathlib import Path
 
+# Fix SSL on Windows
+os.environ["SSL_CERT_FILE"] = certifi.where()
+
 from aira.config.settings import Settings
-from aira.security.path_guard import validate_path
-from aira.security.outbound_guard import sanitise_for_llm
 from aira.security.cost_controller import CostController
 from aira.memory.memory_store import MemoryStore
 from aira.tools.registry import ToolRegistry
 from aira.tools.file_read import FileReadTool
 from aira.tools.file_write import FileWriteTool
 from aira.tools.python_runner import PythonRunnerTool
+from aira.tools.system_read import SystemReadTool
+from aira.tools.system_command_tool import SystemCommandTool
 from aira.llm.local_qwen import LocalQwen
 from aira.llm.external_planner import ExternalPlanner
 from aira.agent.state_machine import StateMachine
@@ -56,8 +61,10 @@ def main() -> None:
     # 2. Ensure workspace exists
     settings.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
-    # 3. Init memory (async)
-    memory = asyncio.run(init_memory(settings.DB_PATH))
+    # 3. Init memory — keep event loop alive for Telegram
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    memory = loop.run_until_complete(init_memory(settings.DB_PATH))
 
     # 4. Security components
     cost_ctrl = CostController(
@@ -75,6 +82,14 @@ def main() -> None:
     tool_registry.register("python_run", PythonRunnerTool(
         settings.WORKSPACE_ROOT, settings.SUBPROCESS_TIMEOUT
     ))
+    # System-wide read (unrestricted)
+    tool_registry.register("system_read", SystemReadTool(settings.MAX_OUTPUT_CHARS))
+    # System command execution (hardened)
+    sys_cmd_tool = SystemCommandTool(
+        timeout=settings.SUBPROCESS_TIMEOUT,
+        log_dir=settings.LOG_DIR
+    )
+    tool_registry.register("system_command", sys_cmd_tool)
 
     # 6. LLMs
     local_llm = LocalQwen(settings.OLLAMA_BASE_URL, settings.OLLAMA_MODEL)
@@ -104,10 +119,14 @@ def main() -> None:
     # 9. Persona
     persona = PersonaManager()
 
-    # 10. Telegram adapter
-    adapter = TelegramAdapter(settings, agent_loop, persona, local_llm, memory)
+    # 10. Telegram adapter (with sys_cmd_tool for confirmation wiring)
+    adapter = TelegramAdapter(
+        settings, agent_loop, persona, local_llm, memory,
+        system_command_tool=sys_cmd_tool,
+    )
 
     logger.info("All components wired. Starting Telegram bot...")
+    logger.info(f"Tools: {tool_registry.list_tools()}")
     adapter.run()
 
 

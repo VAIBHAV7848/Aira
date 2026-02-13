@@ -4,6 +4,8 @@ Cost controller — tracks and enforces spending limits for external API calls.
 
 import json
 import logging
+import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +41,7 @@ class CostController:
         self.total_cost: float = 0.0
         self.call_count: int = 0
         self._persist_path = persist_path
+        self._lock = threading.Lock()
 
         # Load persisted state if exists
         if persist_path and persist_path.exists():
@@ -62,34 +65,36 @@ class CostController:
         Raises:
             BudgetExceededError: If total + estimated exceeds max.
         """
-        projected = self.total_cost + estimated_cost
+        with self._lock:
+            projected = self.total_cost + estimated_cost
 
-        # Hard stop
-        if projected > self.max_cost_usd:
-            raise BudgetExceededError(
-                f"Budget exceeded: projected ${projected:.4f} > "
-                f"cap ${self.max_cost_usd:.2f}. "
-                f"Already spent: ${self.total_cost:.4f}"
-            )
+            # Hard stop
+            if projected > self.max_cost_usd:
+                raise BudgetExceededError(
+                    f"Budget exceeded: projected ${projected:.4f} > "
+                    f"cap ${self.max_cost_usd:.2f}. "
+                    f"Already spent: ${self.total_cost:.4f}"
+                )
 
-        # Warning
-        ratio = projected / self.max_cost_usd if self.max_cost_usd > 0 else 1.0
-        if ratio >= self.warning_threshold:
-            logger.warning(
-                f"Cost warning: at {ratio:.0%} of budget "
-                f"(${projected:.4f} / ${self.max_cost_usd:.2f})"
-            )
+            # Warning
+            ratio = projected / self.max_cost_usd if self.max_cost_usd > 0 else 1.0
+            if ratio >= self.warning_threshold:
+                logger.warning(
+                    f"Cost warning: at {ratio:.0%} of budget "
+                    f"(${projected:.4f} / ${self.max_cost_usd:.2f})"
+                )
 
     def record_cost(self, actual_cost: float) -> None:
         """Record the actual cost of a completed API call."""
-        self.total_cost += actual_cost
-        self.call_count += 1
-        logger.info(
-            f"Cost recorded: ${actual_cost:.6f} | "
-            f"Total: ${self.total_cost:.4f} / ${self.max_cost_usd:.2f} | "
-            f"Calls: {self.call_count}"
-        )
-        self._persist()
+        with self._lock:
+            self.total_cost += actual_cost
+            self.call_count += 1
+            logger.info(
+                f"Cost recorded: ${actual_cost:.6f} | "
+                f"Total: ${self.total_cost:.4f} / ${self.max_cost_usd:.2f} | "
+                f"Calls: {self.call_count}"
+            )
+            self._persist()
 
     def get_summary(self) -> dict:
         """Get a summary of current spending."""
@@ -108,12 +113,13 @@ class CostController:
 
     def reset(self) -> None:
         """Reset the cost tracker (for new tasks)."""
-        self.total_cost = 0.0
-        self.call_count = 0
-        self._persist()
+        with self._lock:
+            self.total_cost = 0.0
+            self.call_count = 0
+            self._persist()
 
     def _persist(self) -> None:
-        """Save state to disk."""
+        """Save state to disk atomically."""
         if self._persist_path:
             data = {
                 "total_cost": self.total_cost,
@@ -121,11 +127,21 @@ class CostController:
                 "max_cost_usd": self.max_cost_usd,
             }
             self._persist_path.parent.mkdir(parents=True, exist_ok=True)
-            self._persist_path.write_text(json.dumps(data, indent=2))
+            tmp_path = self._persist_path.with_suffix(".tmp")
+            try:
+                tmp_path.write_text(json.dumps(data, indent=2))
+                os.replace(str(tmp_path), str(self._persist_path))
+            except Exception as e:
+                logger.error(f"Failed to persist cost state: {e}")
 
     def _load(self) -> None:
         """Load state from disk."""
         if self._persist_path and self._persist_path.exists():
-            data = json.loads(self._persist_path.read_text())
-            self.total_cost = data.get("total_cost", 0.0)
-            self.call_count = data.get("call_count", 0)
+            try:
+                data = json.loads(self._persist_path.read_text())
+                self.total_cost = float(data.get("total_cost", 0.0))
+                self.call_count = int(data.get("call_count", 0))
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                logger.warning(f"Corrupt cost state file, resetting: {e}")
+                self.total_cost = 0.0
+                self.call_count = 0

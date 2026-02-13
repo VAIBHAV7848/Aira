@@ -44,6 +44,11 @@ class Settings:
     TELEGRAM_BOT_TOKEN: str = field(
         default_factory=lambda: _get_str("TELEGRAM_BOT_TOKEN")
     )
+    ALLOWED_USER_IDS: list[int] = field(
+        default_factory=lambda: [
+            int(x.strip()) for x in _get_str("ALLOWED_USER_IDS", "").split(",") if x.strip()
+        ]
+    )
     WORKSPACE_ROOT: Path = field(
         default_factory=lambda: _get_path("WORKSPACE_ROOT", "./aira/workspace")
     )

@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+aira.db
+aira/logs/*.json
+aira/workspace/*
+!aira/workspace/.gitkeep
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+_local_docs/
